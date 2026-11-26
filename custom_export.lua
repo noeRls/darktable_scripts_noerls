@@ -1,8 +1,10 @@
 --[[
-  Export 5-Star RAW + Lossless GPS JPG for darktable (Windows)
+  custom_export for darktable (Windows)
 
   Workflow:
   - Validates strict 1 RAW + 1 JPG pairing for every image in scope (fails fast otherwise).
+  - Recognizes .ARW and all standard camera RAW extensions even before darktable opens them.
+  - Expands collapsed RAW+JPG groups automatically.
   - Skips rejected pairs (rating == -1).
   - Reuses darktable's native Export module output directory & JPEG quality.
   - RAW rated 5 stars: exported via darktable's built-in JPEG format.
@@ -16,6 +18,22 @@ local dt = require "darktable"
 local MODULE = "custom_export"
 local IS_WIN = (dt.configuration.running_os == "windows")
 local PS = IS_WIN and "\\" or "/"
+
+local RAW_EXTENSIONS = {
+  arw = true, srf = true, sr2 = true, -- Sony
+  cr2 = true, cr3 = true, crw = true, -- Canon
+  nef = true, nrw = true,             -- Nikon
+  raf = true,                         -- Fujifilm
+  orf = true,                         -- Olympus / OM System
+  rw2 = true,                         -- Panasonic
+  dng = true,                         -- Adobe / Leica / Pentax / phones
+  pef = true,                         -- Pentax
+  srw = true,                         -- Samsung
+  x3f = true,                         -- Sigma
+  iiq = true, ["3fr"] = true, fff = true, rwl = true,
+  erf = true, mef = true, mrw = true, kdc = true,
+  dcr = true, gpr = true, raw = true, mos = true,
+}
 
 local state = {
   module_installed = false,
@@ -62,7 +80,6 @@ local function normalize_path(p)
     else
       out = out:gsub("\\+", "\\")
     end
-    -- Strip trailing backslash except drive root (e.g. "C:\")
     if #out > 3 or not out:match("^%a:\\$") then
       out = out:gsub("\\+$", "")
     end
@@ -144,7 +161,6 @@ local function ensure_dir(dir_path, cache)
 
   local exit_code
   if IS_WIN then
-    -- Strip trailing slash except drive root
     local target = norm
     if #target > 3 then target = target:gsub("\\+$", "") end
     local cmd = string.format('cmd /c "if not exist "%s" mkdir "%s""', target, target)
@@ -267,7 +283,6 @@ local function expand_export_path(template, raw, jpg, base_name)
       out_path = expanded .. ".jpg"
     end
   else
-    -- Folder-only pattern (e.g. "$(FILE_FOLDER)/export")
     out_path = normalize_path(expanded .. PS .. base_name .. ".jpg")
   end
 
@@ -285,7 +300,7 @@ end
 
 local function make_temp_token()
   math.randomseed(os.time() + math.floor((os.clock() or 0) * 1000))
-  return string.format("dt_exp_%d_%06d", os.time(), math.random(0, 999999))
+  return string.format("dt_cexp_%d_%06d", os.time(), math.random(0, 999999))
 end
 
 local function verify_exiftool(exiftool_bin)
@@ -399,10 +414,10 @@ local function set_status(msg, is_error)
   end
   if is_error then
     dt.print_error(MODULE .. ": " .. msg)
-    dt.print("Export 5-star RAW+JPG: " .. msg)
+    dt.print(MODULE .. ": " .. msg)
   else
     dt.print_log(MODULE .. ": " .. msg)
-    dt.print("Export 5-star RAW+JPG: " .. msg)
+    dt.print(MODULE .. ": " .. msg)
   end
 end
 
@@ -427,15 +442,25 @@ local function run_export()
     jpeg_quality = 95
   end
 
-  -- 2. Collect target images
+  -- 2. Collect target images (expand collapsed darktable groups & deduplicate)
+  local source_list = selected_only and dt.gui.action_images or dt.collection
   local target_images = {}
-  if selected_only then
-    for _, img in ipairs(dt.gui.action_images) do
+  local seen_ids = {}
+
+  local function add_image(img)
+    if img and img.id and not seen_ids[img.id] then
+      seen_ids[img.id] = true
       target_images[#target_images + 1] = img
     end
-  else
-    for _, img in ipairs(dt.collection) do
-      target_images[#target_images + 1] = img
+  end
+
+  for _, img in ipairs(source_list) do
+    add_image(img)
+    local ok_grp, members = pcall(function() return img:get_group_members() end)
+    if ok_grp and type(members) == "table" then
+      for _, member in ipairs(members) do
+        add_image(member)
+      end
     end
   end
 
@@ -452,7 +477,7 @@ local function run_export()
   for _, img in ipairs(target_images) do
     local base, ext = split_ext(img.filename)
     local is_jpg = (ext == "jpg" or ext == "jpeg")
-    local is_raw = (not is_jpg) and (img.is_raw == true)
+    local is_raw = (not is_jpg) and (RAW_EXTENSIONS[ext] == true or img.is_raw == true)
 
     if not is_jpg and not is_raw then
       unexpected_files[#unexpected_files + 1] = img.filename
@@ -581,7 +606,7 @@ local function run_export()
   end
 
   -- 6. Execute export plan
-  local job = dt.gui.create_job("Exporting 5-star RAW + lossless JPG", true, function(j) j.valid = false end)
+  local job = dt.gui.create_job("custom_export", true, function(j) j.valid = false end)
   job.percent = 0.0
 
   local ok_run, run_err = pcall(function()
@@ -615,11 +640,15 @@ local function run_export()
           jpeg_exporter.quality = jpeg_quality
         end
 
+        if overwrite and file_exists(item.out_path) then
+          os.remove(item.out_path)
+        end
+
         local ok_call, res = pcall(function()
           return jpeg_exporter:write_image(item.raw, item.out_path)
         end)
 
-        if (not ok_call) or (res == false) or (not file_exists(item.out_path)) then
+        if (not ok_call) or (not file_exists(item.out_path)) then
           set_status("Failed exporting 5-star RAW " .. item.raw.filename .. ": " .. tostring(res), true)
           return
         end
@@ -701,7 +730,7 @@ local function build_ui()
   }
 
   w.export_btn = dt.new_widget("button") {
-    label = "Export 5-star RAW + JPG",
+    label = "Run custom_export",
     tooltip = "Uses native Export module folder & JPEG quality. 5-star RAWs are rendered; other pairs copy JPG losslessly + write GPS.",
     clicked_callback = run_export,
   }
@@ -728,7 +757,7 @@ local function install_module()
     build_ui()
     dt.register_lib(
       MODULE,
-      "Export 5-star RAW + JPG",
+      "custom_export",
       true,  -- expandable
       false, -- resettable
       { [dt.gui.views.lighttable] = { "DT_UI_CONTAINER_PANEL_RIGHT_CENTER", 501 } },
@@ -756,7 +785,7 @@ end
 -- Script manager compatibility
 local script_data = {}
 script_data.metadata = {
-  name = "Export 5-star RAW + JPG",
+  name = "custom_export",
   purpose = "Export 5-star RAWs via darktable JPEG and losslessly copy remaining JPGs with GPS",
   author = "Custom",
   help = "",
