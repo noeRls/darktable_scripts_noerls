@@ -599,14 +599,24 @@ local function apply_owntracks_gps()
   local overwrite = w.overwrite.value
   local selected_only = w.selected_only.value
 
+  local source_list = selected_only and dt.gui.action_images or dt.collection
   local target_images = {}
-  if selected_only then
-    for _, img in ipairs(dt.gui.action_images) do
+  local seen_ids = {}
+
+  local function add_image(img)
+    if img and img.id and not seen_ids[img.id] then
+      seen_ids[img.id] = true
       target_images[#target_images + 1] = img
     end
-  else
-    for _, img in ipairs(dt.collection) do
-      target_images[#target_images + 1] = img
+  end
+
+  for _, img in ipairs(source_list) do
+    add_image(img)
+    local ok_grp, members = pcall(function() return img:get_group_members() end)
+    if ok_grp and type(members) == "table" then
+      for _, member in ipairs(members) do
+        add_image(member)
+      end
     end
   end
 
